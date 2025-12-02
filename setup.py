@@ -27,7 +27,6 @@ from os import path
 from pkg_resources import parse_requirements
 from setuptools import find_packages, setup
 from setuptools.command.develop import develop
-from setuptools.command.egg_info import egg_info
 from setuptools.command.install import install
 
 
@@ -78,10 +77,8 @@ class CustomDevelopCommand(develop):
         develop.run(self)
 
 
-class CustomEggInfoCommand(egg_info):
-    def run(self):
-        custom_command()
-        egg_info.run(self)
+# Removed CustomEggInfoCommand - egg_info is for metadata generation only
+# and should not run custom installation commands
 
 
 with open("requirements.txt") as requirements_file:
@@ -117,7 +114,6 @@ setup(
     cmdclass={
         "install": CustomInstallCommand,
         "develop": CustomDevelopCommand,
-        "egg_info": CustomEggInfoCommand,
     },
     setup_requires=["pip"],
     install_requires=requirements,

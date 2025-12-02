@@ -6,6 +6,6 @@ module.exports = {
     interpreter_args: '--nproc_per_node=' + '4',
     min_uptime: '5m',
     max_restarts: '5',
-    args: ['--netuid','38','--subtensor.chain_endpoint','wss://entrypoint-finney.opentensor.ai:443','--wallet.name','alexstev','--wallet.hotkey','newstart3','--axon.port','31917','--dht.port','31742','--dht.ip','49.213.134.9','--neuron.upload_steps','3']
+    args: ['--netuid','38','--subtensor.chain_endpoint','wss://entrypoint-finney.opentensor.ai:443','--wallet.name','alexstev','--wallet.hotkey','newstart5','--axon.port','25466','--dht.port','24376','--dht.ip','154.42.3.51','--neuron.upload_steps','50','--neuron.local_batch_size_train','2','--neuron.local_batch_size_train_effective','32']
   }]
 }

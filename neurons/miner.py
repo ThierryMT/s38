@@ -368,36 +368,22 @@ class Miner(BaseMinerNeuron):
                 # Run inner optimizer step
                 self.inner_optimizer_step()
 
-                # Check for early upload trigger (after epoch transition)
-                if self.need_early_epoch_upload and self.local_progress.inner_step >= 2:
-                    # Early upload: We've trained 2-3 steps with new epoch model, upload fresh gradients now
-                    self.logger.info("⚡ Early epoch upload triggered! Uploading fresh gradients from new epoch...")
-                    self.last_upload_step = self.local_progress.inner_step
-                    self.start_background_upload(epoch=self.global_progress.epoch)
-                    self.need_early_epoch_upload = False  # Reset flag
-                    self.logger.info("✅ Early epoch upload completed - validators will have fresh gradients within minutes")
-                elif self.need_upload_after_completion:
-                    # Continuous upload: Previous upload finished, start new one immediately
-                    self.logger.info(f"🔄 Previous upload completed. Starting upload at step {self.local_progress.inner_step}...")
-                    self.last_upload_step = self.local_progress.inner_step
-                    self.start_background_upload(epoch=self.global_progress.epoch)
-                    self.need_upload_after_completion = False  # Reset flag
-                    self.logger.info("start_background_upload compeleted")
-                elif (
+                # Upload model every upload_steps
+                if (
                     self.local_progress.inner_step % self.config.neuron.upload_steps
                     == 0
                 ):
-                    # Normal upload: Upload model every x steps
+                    # Upload model every x steps
                     self.last_upload_step = self.local_progress.inner_step
                     self.start_background_upload(epoch=self.global_progress.epoch)
                     self.logger.info("start_background_upload compeleted")
 
     def inner_optimizer_step(self):
-        # Gradient clipping to prevent instability while allowing larger updates for better loss improvement
-        # Increased from 0.5 to 0.75 to match higher learning rate (2.5e-4) for better gradient quality
+        # Gradient clipping to prevent instability - reduced to match lower learning rate (1.5e-4)
+        # Lower clipping (0.5) provides more stable training and better generalization
         # MEMORY IMPACT: clip_grad_norm_ computes norm (temporary scalar) then scales gradients in-place
         # Uses existing gradient memory only - NEGLIGIBLE memory impact
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.75)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
 
         self.inner_optimizer.step()
 
@@ -432,16 +418,22 @@ class Miner(BaseMinerNeuron):
                     os.makedirs(self.output_dir)
 
                 if self.master:
+                    # Save block_list before clearing it (validators need this for evaluation)
+                    block_list = self.model.config.block_list.copy() if self.model.config.block_list else []
                     self.logger.info(
-                        f"Saving model state dict with {len(full_state)} keys"
+                        f"Saving model state dict with {len(full_state)} keys. Block list has {len(block_list)} blocks: {block_list[-10:] if len(block_list) > 10 else block_list}"
                     )
                     save_file(
                         full_state,
                         os.path.join(self.output_dir, "model.safetensors"),
                         metadata={"format": "pt"},
                     )
+                    # Save config.json with the current block_list (before clearing it)
                     self.model.config.save_pretrained(self.output_dir)
-                    self.logger.info(f"Model Saved")
+                    self.logger.info(f"Model Saved with block_list: {block_list}")
+                    
+                    # Now clear block_list in memory (config.json on disk already has the correct block_list)
+                    self.model.config.block_list = []
 
                     # Save pseudo gradient state
                     torch.save(
@@ -470,9 +462,7 @@ class Miner(BaseMinerNeuron):
                 del optimizer_state
 
                 if self.master:
-                    # Reset model blocklist & keep local copy in case upload fails
-                    block_list = self.model.config.block_list
-                    self.model.config.block_list = []
+                    # block_list was already saved above, keep copy for error recovery
 
                     self.logger.info(
                         f":upload: Uploading model and optimizer states to r2 bucket: {self.config.r2.bucket_name}"
@@ -606,31 +596,10 @@ class Miner(BaseMinerNeuron):
             # Optional: Add callback to handle completion
             def upload_completed(future):
                 try:
-                    result = (
-                        future.result()
-                    )  # This will raise any exceptions that occurred
+                    result = future.result()  # This will raise any exceptions that occurred
                     self.logger.info(
                         f"Model state upload completed with result: {result}"
                     )
-                    
-                    # Only trigger continuous upload if upload SUCCEEDED
-                    # AND enough steps have passed to avoid GPU contention
-                    if result == True:
-                        steps_since_last = self.local_progress.inner_step - self.last_upload_step
-                        # Minimum 2-step gap to prevent frequent GPU state extraction delays
-                        if steps_since_last >= 2:
-                            self.need_upload_after_completion = True
-                            self.logger.info(
-                                f"✅ Upload succeeded! {steps_since_last} steps done. Flagging next upload."
-                            )
-                        else:
-                            self.logger.info(
-                                f"⏸️ Upload succeeded but only {steps_since_last} steps. Waiting for minimum gap."
-                            )
-                    else:
-                        self.logger.info(
-                            f"⚠️ Upload cancelled/failed. Returning to normal schedule."
-                        )
                 except Exception as e:
                     self.logger.error(f"Model state upload failed: {str(e)}")
 
@@ -939,19 +908,8 @@ class Miner(BaseMinerNeuron):
         self.training_status = TrainingStatus.STOPPED
         self.training_error = None
         
-        # Epoch transition upload flag - triggers early upload after epoch transition
-        # to ensure validators have fresh gradients from new epoch within 3-5 minutes
-        self.need_early_epoch_upload = False
-        
-        # Continuous upload flag - triggers upload when previous completes
-        self.need_upload_after_completion = False
-        
-        # Track last upload step to prevent too-frequent uploads (GPU contention)
+        # Track last upload step
         self.last_upload_step = 0
-        
-        # Continuous upload flag - triggers immediate upload when previous upload completes
-        # This ensures uploads happen continuously without waiting for modulo check
-        self.need_upload_after_completion = False
 
     def _init_model_components(self):
         """Initialize model-related components including tokenizer and optimizer settings."""
@@ -972,7 +930,7 @@ class Miner(BaseMinerNeuron):
         # Top miners (UIDs 122, 159) use higher learning rates for better loss improvement scores
         # MEMORY IMPACT: Learning rate is just a scalar multiplier - ZERO memory impact
         # Gradient clipping uses existing gradient memory - NEGLIGIBLE memory impact
-        self.learning_rate_maximum = 2.5e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
+        self.learning_rate_maximum = 1.5e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
         self.weight_decay = 0.1
         self.num_inner_steps = 700  # Increased from 500 for better gradient quality (no memory impact)
         self.offload_optimizer = True
@@ -992,6 +950,9 @@ class Miner(BaseMinerNeuron):
             import traceback
             self.logger.error(traceback.format_exc())
             raise
+        # Ensure model was loaded before accessing it
+        if not hasattr(self, 'model') or self.model is None:
+            raise AttributeError(f"Model was not loaded successfully. self.model is not set after load_state_from_peer")
         self.model.config.block_list = []
         self.logger.info(f"[Rank {self.local_rank}] About to call cleanup_old_cache()")
         cleanup_old_cache(self)
@@ -1373,6 +1334,8 @@ class Miner(BaseMinerNeuron):
 
                 if self.master:
                     self.model.config.block_list.append(self.current_block)
+                    # Save config.json to disk to persist block_list updates
+                    self.model.config.save_pretrained(self.output_dir)
 
                 self._process_training_batch(dataset)
             except Exception as e:
@@ -1522,10 +1485,6 @@ class Miner(BaseMinerNeuron):
                     epoch=self.local_progress.epoch,
                     archive=True,
                 )
-                # Set flag to trigger early upload after training a few steps with new epoch model
-                # This ensures validators get fresh gradients from the new epoch within 3-5 minutes
-                self.need_early_epoch_upload = True
-                self.logger.info("🔔 Early epoch upload flag set - will upload after 2-3 training steps")
                 self.all_reduce_flag = 0
                 self.reload_state_event.clear()
                 # Resume training when done
