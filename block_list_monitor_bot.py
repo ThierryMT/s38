@@ -51,11 +51,218 @@ class BlockListMonitorBot:
             return False
     
     def clear_gpu_processes(self):
-        """Clear all GPU processes (zombie processes) before restart"""
+        """Clear ALL GPU processes on ALL GPUs before restart to prevent CUDA OOM errors"""
         try:
-            self.log("🧹 Clearing GPU processes...")
+            self.log("🧹 Checking and clearing ALL GPUs before restart...")
             
-            # Check GPU usage
+            # Step 1: Check current GPU status
+            try:
+                nvidia_result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if nvidia_result.returncode == 0:
+                    lines = [l.strip() for l in nvidia_result.stdout.strip().split('\n') if l.strip()]
+                    self.log(f"   📊 Found {len(lines)} GPU(s)")
+                    for line in lines:
+                        parts = line.split(',')
+                        if len(parts) >= 3:
+                            try:
+                                gpu_id = parts[0].strip()
+                                used = int(parts[1].strip())
+                                total = int(parts[2].strip())
+                                self.log(f"      GPU {gpu_id}: {used}MB / {total}MB used")
+                            except:
+                                pass
+            except Exception as e:
+                self.log(f"   ⚠️  Could not check GPU status: {e}")
+            
+            # Step 2: Get all processes using GPU via nvidia-smi
+            gpu_pids = set()
+            try:
+                nvidia_result = subprocess.run(
+                    ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if nvidia_result.returncode == 0 and nvidia_result.stdout.strip():
+                    lines = [l.strip() for l in nvidia_result.stdout.strip().split('\n') if l.strip()]
+                    for line in lines:
+                        parts = line.split(',')
+                        if len(parts) >= 1:
+                            pid = parts[0].strip()
+                            if pid.isdigit():
+                                gpu_pids.add(pid)
+                                process_name = parts[1].strip() if len(parts) > 1 else "[Unknown]"
+                                memory = parts[2].strip() if len(parts) > 2 else "[Unknown]"
+                                self.log(f"   🔍 Found process using GPU: PID {pid} ({process_name}) - {memory}")
+            except FileNotFoundError:
+                self.log("   ⚠️  nvidia-smi not found, will use alternative methods")
+            except Exception as e:
+                self.log(f"   ⚠️  Error checking nvidia-smi: {e}")
+            
+            # Step 3: Kill all processes using GPU devices directly (including nvidia-uvm, nvidiactl)
+            try:
+                # Check all GPU device files
+                gpu_devices = []
+                # Check numbered GPU devices (nvidia0, nvidia1, etc.)
+                for device_num in range(8):  # Check up to 8 GPUs
+                    device = f"/dev/nvidia{device_num}"
+                    if os.path.exists(device):
+                        gpu_devices.append(device)
+                
+                # Also check common NVIDIA device files
+                for device_name in ["/dev/nvidia-uvm", "/dev/nvidiactl"]:
+                    if os.path.exists(device_name):
+                        gpu_devices.append(device_name)
+                
+                # Kill processes using each device
+                for device in gpu_devices:
+                    try:
+                        # First, find processes using this device
+                        fuser_result = subprocess.run(
+                            ["fuser", device],
+                            capture_output=True,
+                            text=True,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2
+                        )
+                        if fuser_result.returncode == 0:
+                            # Extract PIDs from fuser output
+                            pids = [p.strip() for p in fuser_result.stdout.strip().split() if p.strip().isdigit()]
+                            gpu_pids.update(pids)
+                            
+                            # Kill processes using this device
+                            subprocess.run(
+                                ["fuser", "-k", device],
+                                capture_output=True,
+                                stderr=subprocess.DEVNULL,
+                                timeout=2
+                            )
+                            if pids:
+                                self.log(f"   ✅ Killed processes using {device}: {', '.join(pids)}")
+                    except:
+                        pass
+            except Exception as e:
+                self.log(f"   ⚠️  Error checking GPU devices: {e}")
+            
+            # Step 4: Kill all GPU processes found by PID
+            if gpu_pids:
+                for pid in gpu_pids:
+                    try:
+                        subprocess.run(
+                            ["kill", "-9", pid],
+                            capture_output=True,
+                            timeout=2,
+                            stderr=subprocess.DEVNULL
+                        )
+                        self.log(f"   ✅ Killed GPU process {pid}")
+                    except Exception as e:
+                        self.log(f"   ⚠️  Could not kill process {pid}: {e}")
+            
+            # Step 5: Aggressively kill Python/torchrun/training processes that might hold GPU
+            try:
+                patterns = [
+                    "python.*miner",
+                    "torchrun",
+                    "hivemind",
+                    "distributed_training",
+                    "python.*training"
+                ]
+                killed_any = False
+                for pattern in patterns:
+                    try:
+                        pkill_result = subprocess.run(
+                            ["pkill", "-9", "-f", pattern],
+                            capture_output=True,
+                            timeout=3,
+                            stderr=subprocess.DEVNULL
+                        )
+                        if pkill_result.returncode == 0:
+                            self.log(f"   ✅ Killed processes matching pattern: {pattern}")
+                            killed_any = True
+                    except:
+                        pass
+                if not killed_any:
+                    self.log("   ℹ️  No zombie training processes found")
+            except Exception as e:
+                self.log(f"   ⚠️  Error killing training processes: {e}")
+            
+            # Step 6: Wait for processes to release GPU memory
+            self.log("   ⏳ Waiting for GPU memory to be released...")
+            time.sleep(3)
+            
+            # Step 7: Verify ALL GPUs are clear (with retries)
+            max_retries = 5
+            all_gpus_clear = False
+            for attempt in range(max_retries):
+                try:
+                    nvidia_result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    
+                    if nvidia_result.returncode == 0:
+                        lines = [l.strip() for l in nvidia_result.stdout.strip().split('\n') if l.strip()]
+                        all_clear = True
+                        max_used = 0
+                        
+                        for line in lines:
+                            parts = line.split(',')
+                            if len(parts) >= 3:
+                                try:
+                                    gpu_id = parts[0].strip()
+                                    used = int(parts[1].strip())
+                                    total = int(parts[2].strip())
+                                    max_used = max(max_used, used)
+                                    
+                                    # Consider GPU clear if less than 10MB used (driver overhead)
+                                    if used >= 10:
+                                        all_clear = False
+                                except:
+                                    pass
+                        
+                        if all_clear:
+                            self.log(f"   ✅ ALL GPUs cleared successfully (max memory used: {max_used}MB)")
+                            all_gpus_clear = True
+                            break
+                        else:
+                            if attempt < max_retries - 1:
+                                self.log(f"   ⚠️  Some GPUs still have memory allocated (max: {max_used}MB), retrying... (attempt {attempt + 1}/{max_retries})")
+                                # Try killing any remaining processes
+                                try:
+                                    nvidia_result = subprocess.run(
+                                        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=5
+                                    )
+                                    if nvidia_result.returncode == 0 and nvidia_result.stdout.strip():
+                                        pids = [pid.strip() for pid in nvidia_result.stdout.strip().split('\n') if pid.strip()]
+                                        for pid in pids:
+                                            try:
+                                                subprocess.run(["kill", "-9", pid], capture_output=True, timeout=1, stderr=subprocess.DEVNULL)
+                                            except:
+                                                pass
+                                except:
+                                    pass
+                                time.sleep(2)
+                            else:
+                                self.log(f"   ⚠️  Some GPUs still have memory allocated (max: {max_used}MB) after {max_retries} attempts")
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        self.log(f"   ⚠️  Could not verify GPU status, retrying... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(2)
+                    else:
+                        self.log(f"   ⚠️  Could not verify GPU status: {e}")
+            
+            # Step 8: Final verification - check for any remaining processes
             try:
                 nvidia_result = subprocess.run(
                     ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
@@ -63,86 +270,14 @@ class BlockListMonitorBot:
                     text=True,
                     timeout=5
                 )
-                
                 if nvidia_result.returncode == 0 and nvidia_result.stdout.strip():
-                    pids = [pid.strip() for pid in nvidia_result.stdout.strip().split('\n') if pid.strip()]
-                    if pids:
-                        self.log(f"🔍 Found {len(pids)} process(es) using GPU: {', '.join(pids)}")
-                        
-                        # Kill processes using GPU
-                        for pid in pids:
-                            try:
-                                subprocess.run(
-                                    ["kill", "-9", pid],
-                                    capture_output=True,
-                                    timeout=2
-                                )
-                                self.log(f"   ✅ Killed process {pid}")
-                            except Exception as e:
-                                self.log(f"   ⚠️  Could not kill process {pid}: {e}")
-                else:
-                    self.log("   ℹ️  No processes found using GPU")
-            except FileNotFoundError:
-                self.log("   ⚠️  nvidia-smi not found, skipping GPU process check")
-            except subprocess.TimeoutExpired:
-                self.log("   ⚠️  Timeout checking GPU processes")
-            except Exception as e:
-                self.log(f"   ⚠️  Error checking GPU: {e}")
-            
-            # Kill any Python/torchrun processes that might be holding GPU
-            try:
-                # Kill Python processes related to miner/training
-                pkill_result = subprocess.run(
-                    ["pkill", "-9", "-f", "python.*miner|torchrun|hivemind"],
-                    capture_output=True,
-                    timeout=3
-                )
-                
-                # Also try to kill processes using GPU devices directly
-                try:
-                    # Try to find and kill processes using /dev/nvidia devices
-                    for device in ["/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3"]:
-                        try:
-                            fuser_result = subprocess.run(
-                                ["fuser", "-k", device],
-                                capture_output=True,
-                                stderr=subprocess.DEVNULL,
-                                timeout=2
-                            )
-                        except:
-                            pass
-                except:
-                    pass
-                
-                if pkill_result.returncode == 0 or pkill_result.returncode == 1:  # 1 means no processes found
-                    if pkill_result.returncode == 0:
-                        self.log("   ✅ Killed zombie Python/torchrun processes")
+                    remaining_pids = [pid.strip() for pid in nvidia_result.stdout.strip().split('\n') if pid.strip()]
+                    if remaining_pids:
+                        self.log(f"   ⚠️  Warning: {len(remaining_pids)} process(es) still using GPU: {', '.join(remaining_pids)}")
                     else:
-                        self.log("   ℹ️  No zombie processes found to kill")
-            except Exception as e:
-                self.log(f"   ⚠️  Error killing zombie processes: {e}")
-            
-            # Wait a moment for processes to release GPU
-            time.sleep(2)
-            
-            # Verify GPU is clear
-            try:
-                nvidia_result = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                if nvidia_result.returncode == 0:
-                    memory_usage = nvidia_result.stdout.strip().split('\n')
-                    total_usage = sum(int(usage.strip()) for usage in memory_usage if usage.strip().isdigit())
-                    if total_usage < 1000:  # Less than 1GB total across all GPUs
-                        self.log(f"   ✅ GPU cleared successfully (total memory: {total_usage}MB)")
-                    else:
-                        self.log(f"   ⚠️  GPU still has {total_usage}MB allocated")
-            except Exception as e:
-                self.log(f"   ⚠️  Could not verify GPU status: {e}")
+                        self.log("   ✅ Verified: No processes using GPU")
+            except:
+                pass
                 
         except Exception as e:
             self.log(f"   ⚠️  Error during GPU cleanup: {e}")

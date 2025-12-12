@@ -31,16 +31,27 @@ from setuptools.command.install import install
 
 
 def custom_command():
-    import pip
+    import sys
 
-    pip.main(
+    # Use subprocess to call pip instead of deprecated pip.main()
+    subprocess.run(
         [
+            sys.executable,
+            "-m",
+            "pip",
             "install",
             "git+https://github.com/learning-at-home/hivemind.git@3a4cc15e29ce51b20c5d415a4c579abbae435718",
-        ]
+        ],
+        check=True,
     )
-    pip.main(["install", "bittensor==9.12.2"])
-    pip.main(["install", "py-multihash==2.0.1"])
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "bittensor==9.12.2"],
+        check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "py-multihash==2.0.1"],
+        check=True,
+    )
 
     # Install Go and HFDownloader
     try:

@@ -1,4 +1,7 @@
 // PM2 configuration for the block list monitor bot
+// NOTE: When the bot restarts the distributed_training_miner process,
+// it will FIRST clear all GPU processes to free up GPU memory before restarting.
+// This prevents CUDA out of memory errors.
 module.exports = {
   apps: [{
     name: 'block_list_monitor_bot',

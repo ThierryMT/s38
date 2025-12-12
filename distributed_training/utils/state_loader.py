@@ -856,26 +856,132 @@ def load_model_optimizer_gradient_averager(
                     num_warmup_steps=1000,
                     num_training_steps=88000,
                 )
-            if use_cache is False:
-                optimizer_state_path = r2_download(
-                    self,
-                    r2=r2,
-                    bucket=local_model_name,
-                    key=f"{prefix}inner_optimizer.rank{self.local_rank+1:04d}-of-{self.world_size}.pt",
-                    donwload_on_all_ranks=True,
-                    run_on_all_ranks=True,
-                    destination=output_dir,
+            # Load optimizer state with corruption detection and retry logic
+            MAX_LOAD_RETRIES = 3
+            load_attempt = 0
+            optimizer_state = None
+            optimizer_state_path = None
+            
+            while load_attempt < MAX_LOAD_RETRIES:
+                try:
+                    # Download or get path to optimizer state file
+                    if use_cache is False:
+                        optimizer_state_path = r2_download(
+                            self,
+                            r2=r2,
+                            bucket=local_model_name,
+                            key=f"{prefix}inner_optimizer.rank{self.local_rank+1:04d}-of-{self.world_size}.pt",
+                            donwload_on_all_ranks=True,
+                            run_on_all_ranks=True,
+                            destination=output_dir,
+                        )
+                    else:
+                        optimizer_state_path = os.path.join(
+                            self.output_dir,
+                            f"inner_optimizer.rank{self.local_rank+1:04d}-of-{self.world_size}.pt",
+                        )
+                    
+                    # Validate file exists and has reasonable size
+                    if not os.path.exists(optimizer_state_path):
+                        raise FileNotFoundError(
+                            f"Optimizer state file not found: {optimizer_state_path}"
+                        )
+                    
+                    file_size = os.path.getsize(optimizer_state_path)
+                    if file_size == 0:
+                        raise ValueError(
+                            f"Optimizer state file is empty (0 bytes): {optimizer_state_path}"
+                        )
+                    
+                    if file_size < 1024:  # Less than 1KB is suspicious
+                        self.logger.warning(
+                            f"Optimizer state file is unusually small ({file_size} bytes): {optimizer_state_path}"
+                        )
+                    
+                    # Attempt to load the checkpoint
+                    self.logger.info(
+                        f"Loading optimizer state from {optimizer_state_path} "
+                        f"(attempt {load_attempt + 1}/{MAX_LOAD_RETRIES}, size: {file_size} bytes)"
+                    )
+                    optimizer_state = torch.load(
+                        optimizer_state_path, map_location="cpu", weights_only=True
+                    )
+                    
+                    # Validate loaded state structure
+                    if not isinstance(optimizer_state, dict):
+                        raise ValueError(
+                            f"Loaded optimizer state is not a dictionary: {type(optimizer_state)}"
+                        )
+                    
+                    if "optimizer_state_dict" not in optimizer_state:
+                        raise ValueError(
+                            "Loaded optimizer state missing required key 'optimizer_state_dict'"
+                        )
+                    
+                    self.logger.info(f"Successfully loaded optimizer state (size: {file_size} bytes)")
+                    break  # Success - exit retry loop
+                    
+                except (RuntimeError, ValueError, FileNotFoundError) as e:
+                    error_msg = str(e)
+                    is_corruption_error = (
+                        "PytorchStreamReader" in error_msg or
+                        "failed finding central directory" in error_msg or
+                        "zip archive" in error_msg.lower() or
+                        "corrupted" in error_msg.lower()
+                    )
+                    
+                    load_attempt += 1
+                    
+                    if is_corruption_error or isinstance(e, (FileNotFoundError, ValueError)):
+                        self.logger.warning(
+                            f"❌ Failed to load optimizer state (attempt {load_attempt}/{MAX_LOAD_RETRIES}): {error_msg}"
+                        )
+                        
+                        # Delete corrupted file if it exists
+                        if optimizer_state_path and os.path.exists(optimizer_state_path):
+                            try:
+                                os.remove(optimizer_state_path)
+                                self.logger.info(
+                                    f"🗑️  Deleted corrupted file: {optimizer_state_path}"
+                                )
+                            except Exception as delete_error:
+                                self.logger.warning(
+                                    f"Failed to delete corrupted file: {delete_error}"
+                                )
+                        
+                        # If we have retries left and not using cache, try re-downloading
+                        if load_attempt < MAX_LOAD_RETRIES and use_cache is False:
+                            self.logger.info(
+                                f"🔄 Retrying download and load (attempt {load_attempt + 1}/{MAX_LOAD_RETRIES})..."
+                            )
+                            time.sleep(1)  # Brief delay before retry
+                            continue
+                        elif load_attempt < MAX_LOAD_RETRIES and use_cache is True:
+                            # If using cache and file is corrupted, try downloading fresh copy
+                            self.logger.info(
+                                f"🔄 Cache file corrupted, attempting fresh download (attempt {load_attempt + 1}/{MAX_LOAD_RETRIES})..."
+                            )
+                            use_cache = False  # Switch to download mode
+                            time.sleep(1)
+                            continue
+                    
+                    # If it's not a corruption error or we've exhausted retries, re-raise
+                    if load_attempt >= MAX_LOAD_RETRIES:
+                        self.logger.error(
+                            f"❌ Failed to load optimizer state after {MAX_LOAD_RETRIES} attempts. "
+                            f"Last error: {error_msg}"
+                        )
+                        raise
+                    else:
+                        # Unexpected error, re-raise immediately
+                        raise
+            
+            if optimizer_state is None:
+                raise RuntimeError(
+                    f"Failed to load optimizer state after {MAX_LOAD_RETRIES} attempts"
                 )
-            else:
-                optimizer_state_path = os.path.join(
-                    self.output_dir,
-                    f"inner_optimizer.rank{self.local_rank+1:04d}-of-{self.world_size}.pt",
-                )
-
-            optimizer_state = torch.load(
-                optimizer_state_path, map_location="cpu", weights_only=True
-            )
-            self.logger.info(f"Donwloaded Optimizer State")
+            
+            self.logger.info(f"Downloaded Optimizer State")
 
             inner_optimizer_loading_options = StateDictOptions(
                 full_state_dict=False, cpu_offload=True
@@ -908,13 +1014,14 @@ def load_model_optimizer_gradient_averager(
         return loading_success
 
     finally:
-        if isinstance(optimizer_state, dict):
-            keys = list(optimizer_state.keys())
-            for k in keys:
-                del optimizer_state[k]
-                gc.collect()
-        del optimizer_state
-        gc.collect()
+        if optimizer_state is not None:
+            if isinstance(optimizer_state, dict):
+                keys = list(optimizer_state.keys())
+                for k in keys:
+                    del optimizer_state[k]
+                    gc.collect()
+            del optimizer_state
+            gc.collect()
         torch.cuda.empty_cache()
 
     if self.master:
