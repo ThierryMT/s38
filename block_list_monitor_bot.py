@@ -50,36 +50,142 @@ class BlockListMonitorBot:
             self.log("❌ Error: pm2 command not found")
             return False
     
+    def check_nvidia_status(self):
+        """Check NVIDIA GPU status and return GPU information"""
+        gpu_info = []
+        try:
+            self.log("📊 Checking NVIDIA GPU status...")
+            nvidia_result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if nvidia_result.returncode == 0:
+                lines = [l.strip() for l in nvidia_result.stdout.strip().split('\n') if l.strip()]
+                self.log(f"   📊 Found {len(lines)} GPU(s)")
+                for line in lines:
+                    parts = line.split(',')
+                    if len(parts) >= 3:
+                        try:
+                            gpu_id = parts[0].strip()
+                            used = int(parts[1].strip())
+                            total = int(parts[2].strip())
+                            gpu_info.append({"id": gpu_id, "used": used, "total": total})
+                            self.log(f"      GPU {gpu_id}: {used}MB / {total}MB used")
+                        except:
+                            pass
+            else:
+                self.log("   ⚠️  nvidia-smi returned non-zero exit code")
+        except FileNotFoundError:
+            self.log("   ❌ nvidia-smi not found - NVIDIA drivers may not be installed")
+        except Exception as e:
+            self.log(f"   ⚠️  Could not check GPU status: {e}")
+        return gpu_info
+    
+    def kill_all_zombie_processes(self):
+        """Kill all zombie processes related to training/mining"""
+        self.log("🧹 Killing all zombie processes...")
+        
+        zombie_patterns = [
+            "python.*miner",
+            "python.*training",
+            "torchrun",
+            "hivemind",
+            "distributed_training",
+            "python.*neurons",
+            "python.*distributed"
+        ]
+        
+        killed_count = 0
+        for pattern in zombie_patterns:
+            try:
+                # First, find processes
+                pgrep_result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    stderr=subprocess.DEVNULL
+                )
+                
+                if pgrep_result.returncode == 0 and pgrep_result.stdout.strip():
+                    pids = [pid.strip() for pid in pgrep_result.stdout.strip().split('\n') if pid.strip()]
+                    for pid in pids:
+                        try:
+                            # Try graceful kill first
+                            subprocess.run(
+                                ["kill", "-TERM", pid],
+                                capture_output=True,
+                                timeout=1,
+                                stderr=subprocess.DEVNULL
+                            )
+                            time.sleep(0.5)
+                            # Force kill if still running
+                            subprocess.run(
+                                ["kill", "-9", pid],
+                                capture_output=True,
+                                timeout=1,
+                                stderr=subprocess.DEVNULL
+                            )
+                            killed_count += 1
+                            self.log(f"   ✅ Killed zombie process: PID {pid} (pattern: {pattern})")
+                        except:
+                            pass
+            except FileNotFoundError:
+                # pgrep not available, use pkill
+                try:
+                    pkill_result = subprocess.run(
+                        ["pkill", "-9", "-f", pattern],
+                        capture_output=True,
+                        timeout=3,
+                        stderr=subprocess.DEVNULL
+                    )
+                    if pkill_result.returncode == 0:
+                        killed_count += 1
+                        self.log(f"   ✅ Killed processes matching pattern: {pattern}")
+                except:
+                    pass
+            except Exception as e:
+                self.log(f"   ⚠️  Error killing processes for pattern {pattern}: {e}")
+        
+        # Also kill any orphaned Python processes that might be holding resources
+        try:
+            ps_result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if ps_result.returncode == 0:
+                for line in ps_result.stdout.split('\n'):
+                    if 'python' in line.lower() and ('miner' in line.lower() or 'training' in line.lower() or 'torchrun' in line.lower()):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            pid = parts[1]
+                            if pid.isdigit():
+                                try:
+                                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=1, stderr=subprocess.DEVNULL)
+                                    killed_count += 1
+                                    self.log(f"   ✅ Killed orphaned process: PID {pid}")
+                                except:
+                                    pass
+        except:
+            pass
+        
+        if killed_count == 0:
+            self.log("   ℹ️  No zombie processes found")
+        else:
+            self.log(f"   ✅ Killed {killed_count} zombie process(es)")
+        
+        return killed_count
+    
     def clear_gpu_processes(self):
         """Clear ALL GPU processes on ALL GPUs before restart to prevent CUDA OOM errors"""
         try:
-            self.log("🧹 Checking and clearing ALL GPUs before restart...")
+            self.log("🧹 Clearing ALL GPU processes before restart...")
             
-            # Step 1: Check current GPU status
-            try:
-                nvidia_result = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if nvidia_result.returncode == 0:
-                    lines = [l.strip() for l in nvidia_result.stdout.strip().split('\n') if l.strip()]
-                    self.log(f"   📊 Found {len(lines)} GPU(s)")
-                    for line in lines:
-                        parts = line.split(',')
-                        if len(parts) >= 3:
-                            try:
-                                gpu_id = parts[0].strip()
-                                used = int(parts[1].strip())
-                                total = int(parts[2].strip())
-                                self.log(f"      GPU {gpu_id}: {used}MB / {total}MB used")
-                            except:
-                                pass
-            except Exception as e:
-                self.log(f"   ⚠️  Could not check GPU status: {e}")
-            
-            # Step 2: Get all processes using GPU via nvidia-smi
+            # Step 1: Get all processes using GPU via nvidia-smi
             gpu_pids = set()
             try:
                 nvidia_result = subprocess.run(
@@ -105,7 +211,8 @@ class BlockListMonitorBot:
             except Exception as e:
                 self.log(f"   ⚠️  Error checking nvidia-smi: {e}")
             
-            # Step 3: Kill all processes using GPU devices directly (including nvidia-uvm, nvidiactl)
+            
+            # Step 2: Kill all processes using GPU devices directly (including nvidia-uvm, nvidiactl)
             try:
                 # Check all GPU device files
                 gpu_devices = []
@@ -150,7 +257,7 @@ class BlockListMonitorBot:
             except Exception as e:
                 self.log(f"   ⚠️  Error checking GPU devices: {e}")
             
-            # Step 4: Kill all GPU processes found by PID
+            # Step 3: Kill all GPU processes found by PID
             if gpu_pids:
                 for pid in gpu_pids:
                     try:
@@ -164,39 +271,11 @@ class BlockListMonitorBot:
                     except Exception as e:
                         self.log(f"   ⚠️  Could not kill process {pid}: {e}")
             
-            # Step 5: Aggressively kill Python/torchrun/training processes that might hold GPU
-            try:
-                patterns = [
-                    "python.*miner",
-                    "torchrun",
-                    "hivemind",
-                    "distributed_training",
-                    "python.*training"
-                ]
-                killed_any = False
-                for pattern in patterns:
-                    try:
-                        pkill_result = subprocess.run(
-                            ["pkill", "-9", "-f", pattern],
-                            capture_output=True,
-                            timeout=3,
-                            stderr=subprocess.DEVNULL
-                        )
-                        if pkill_result.returncode == 0:
-                            self.log(f"   ✅ Killed processes matching pattern: {pattern}")
-                            killed_any = True
-                    except:
-                        pass
-                if not killed_any:
-                    self.log("   ℹ️  No zombie training processes found")
-            except Exception as e:
-                self.log(f"   ⚠️  Error killing training processes: {e}")
-            
-            # Step 6: Wait for processes to release GPU memory
+            # Step 4: Wait for processes to release GPU memory
             self.log("   ⏳ Waiting for GPU memory to be released...")
             time.sleep(3)
             
-            # Step 7: Verify ALL GPUs are clear (with retries)
+            # Step 5: Verify ALL GPUs are clear (with retries)
             max_retries = 5
             all_gpus_clear = False
             for attempt in range(max_retries):
@@ -262,7 +341,7 @@ class BlockListMonitorBot:
                     else:
                         self.log(f"   ⚠️  Could not verify GPU status: {e}")
             
-            # Step 8: Final verification - check for any remaining processes
+            # Step 6: Final verification - check for any remaining processes
             try:
                 nvidia_result = subprocess.run(
                     ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
@@ -283,7 +362,7 @@ class BlockListMonitorBot:
             self.log(f"   ⚠️  Error during GPU cleanup: {e}")
     
     def restart_pm2_process(self):
-        """Restart the pm2 process"""
+        """Restart the pm2 process with proper cleanup: check nvidia -> clear GPU -> kill zombies -> verify -> restart"""
         current_time = time.time()
         
         # Check cooldown to prevent rapid restarts
@@ -293,12 +372,44 @@ class BlockListMonitorBot:
             return False
         
         try:
-            self.log(f"⚠️  Trigger detected! Restarting {self.process_name}...")
+            self.log("=" * 70)
+            self.log(f"⚠️  Trigger detected! Preparing to restart {self.process_name}...")
+            self.log("=" * 70)
             
-            # Clear GPU processes before restart
+            # Step 1: Check NVIDIA status first
+            gpu_info = self.check_nvidia_status()
+            
+            # Step 2: Clear all GPU processes
             self.clear_gpu_processes()
             
-            # Restart the process
+            # Step 3: Kill all zombie processes
+            self.kill_all_zombie_processes()
+            
+            # Step 4: Wait a bit for everything to settle
+            self.log("   ⏳ Waiting for processes to fully terminate...")
+            time.sleep(2)
+            
+            # Step 5: Final verification - check NVIDIA status again
+            self.log("   🔍 Verifying cleanup...")
+            final_gpu_info = self.check_nvidia_status()
+            
+            # Check if GPUs are clear (less than 10MB used per GPU)
+            all_clear = True
+            for gpu in final_gpu_info:
+                if gpu.get("used", 0) >= 10:
+                    all_clear = False
+                    break
+            
+            if all_clear:
+                self.log("   ✅ All GPUs cleared successfully")
+            else:
+                self.log("   ⚠️  Some GPUs may still have memory allocated, but proceeding with restart...")
+            
+            # Step 6: Restart the PM2 process
+            self.log("=" * 70)
+            self.log(f"🔄 Restarting {self.process_name}...")
+            self.log("=" * 70)
+            
             result = subprocess.run(
                 ["pm2", "restart", self.process_name],
                 capture_output=True,
@@ -311,8 +422,10 @@ class BlockListMonitorBot:
             self.restart_count += 1
             self.trigger_detected = False  # Reset trigger flag after restart
             
+            self.log("=" * 70)
             self.log(f"✅ Successfully restarted {self.process_name} (restart #{self.restart_count})")
             self.log(f"⏳ Waiting {RESTART_COOLDOWN} seconds before resuming monitoring...")
+            self.log("=" * 70)
             time.sleep(RESTART_COOLDOWN)
             
             # Reset log position after restart - will reinitialize to end of file
@@ -321,11 +434,20 @@ class BlockListMonitorBot:
             return True
             
         except subprocess.CalledProcessError as e:
+            self.log("=" * 70)
             self.log(f"❌ Error restarting process: {e}")
             self.log(f"Error output: {e.stderr if e.stderr else 'None'}")
+            self.log("=" * 70)
             return False
         except subprocess.TimeoutExpired:
+            self.log("=" * 70)
             self.log("❌ Timeout while restarting process")
+            self.log("=" * 70)
+            return False
+        except Exception as e:
+            self.log("=" * 70)
+            self.log(f"❌ Unexpected error during restart: {e}")
+            self.log("=" * 70)
             return False
     
     def initialize_log_position(self):

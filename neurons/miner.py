@@ -383,7 +383,7 @@ class Miner(BaseMinerNeuron):
         # Lower clipping (0.5) provides more stable training and better generalization
         # MEMORY IMPACT: clip_grad_norm_ computes norm (temporary scalar) then scales gradients in-place
         # Uses existing gradient memory only - NEGLIGIBLE memory impact
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.3)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
 
         self.inner_optimizer.step()
 
@@ -930,7 +930,7 @@ class Miner(BaseMinerNeuron):
         # Top miners (UIDs 122, 159) use higher learning rates for better loss improvement scores
         # MEMORY IMPACT: Learning rate is just a scalar multiplier - ZERO memory impact
         # Gradient clipping uses existing gradient memory - NEGLIGIBLE memory impact
-        self.learning_rate_maximum = 1.0e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
+        self.learning_rate_maximum = 3.0e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
         self.weight_decay = 0.1
         self.num_inner_steps = 700  # Increased from 500 for better gradient quality (no memory impact)
         self.offload_optimizer = True

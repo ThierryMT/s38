@@ -264,14 +264,14 @@
   "attention_bias": false,
   "attention_dropout": 0.0,
   "block_list": [
-    7075709
+    7081162
   ],
   "bos_token_id": 128000,
   "eos_token_id": 128001,
   "hidden_act": "silu",
   "hidden_size": 2880,
   "initializer_range": 0.02,
-  "inner_step": 60,
+  "inner_step": 90,
   "intermediate_size": 10080,
   "last_allreduce_block": 7000828,
   "max_position_embeddings": 8192,
