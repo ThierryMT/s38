@@ -1,5 +1,5 @@
 {
-  "_name_or_path": "/workspace/s38/llama-4b-ws-4",
+  "_name_or_path": "/workspace/s38/llama-4b-ws-4-227",
   "all_reduce_scores": {
     "0": "SUCCESS",
     "1": "SUCCESS",
@@ -264,14 +264,15 @@
   "attention_bias": false,
   "attention_dropout": 0.0,
   "block_list": [
-    7081162
+    7135376,
+    7135376
   ],
   "bos_token_id": 128000,
   "eos_token_id": 128001,
   "hidden_act": "silu",
   "hidden_size": 2880,
   "initializer_range": 0.02,
-  "inner_step": 90,
+  "inner_step": 7500,
   "intermediate_size": 10080,
   "last_allreduce_block": 7000828,
   "max_position_embeddings": 8192,

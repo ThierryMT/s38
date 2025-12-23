@@ -60,7 +60,7 @@ R2 = boto3.session.Session().client(
         max_pool_connections=50,
     ),
 )
-__run__ = "1"
+__run__ = "4"
 
 # === LOGGER SETUP ===
 logging.basicConfig(
@@ -420,7 +420,7 @@ def evaluate_with_lm_harness(
     cmd_parts = [
         "lm-eval",
         "--model hf",
-        f"--model_args pretrained={REPO_ID},revision={tag}",
+        f"--model_args pretrained={REPO_ID},parallelize=True",
         f"--tasks {','.join(tasks)}",
         f"--device {device}",
         f"--batch_size 4",

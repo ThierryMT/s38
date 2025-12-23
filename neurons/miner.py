@@ -622,15 +622,13 @@ class Miner(BaseMinerNeuron):
         self.training_status = TrainingStatus.RUNNING
         self.logger.info(":white_heavy_check_mark: Resuming continuous training.")
 
-    async def fetch_training_data(self):
+    async def fetch_training_data(self, block: int):
         """Async function to fetch training data"""
         attempt = 0
         while attempt < self.retry_limit:
             try:
-                self.set_current_block_across_ranks()
-
                 pages = await DatasetLoader.next_pages(
-                    offset=self.current_block,
+                    offset=block,
                     n_pages=5,
                     seed=self.uid + self.local_rank,
                 )
@@ -930,9 +928,9 @@ class Miner(BaseMinerNeuron):
         # Top miners (UIDs 122, 159) use higher learning rates for better loss improvement scores
         # MEMORY IMPACT: Learning rate is just a scalar multiplier - ZERO memory impact
         # Gradient clipping uses existing gradient memory - NEGLIGIBLE memory impact
-        self.learning_rate_maximum = 3.0e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
-        self.weight_decay = 0.1
-        self.num_inner_steps = 700  # Increased from 500 for better gradient quality (no memory impact)
+        self.learning_rate_maximum = 1.0e-4  # Increased from 2.0e-4 to match validator (2.5e-4) for better gradient quality and loss improvement
+        self.weight_decay = 0.5
+        self.num_inner_steps = 500  # Increased from 500 for better gradient quality (no memory impact)
         self.offload_optimizer = True
 
         # Upload settings
@@ -1324,16 +1322,19 @@ class Miner(BaseMinerNeuron):
                 # Wait if training is paused
                 self.training_active.wait()
 
-                self.logger.debug(":pages: Fetching fineweb-edu pages")
+                self.set_current_block_across_ranks()
+                block_at_start = self.current_block
+                self.logger.debug(f"Block passed to dataloader and block list: {block_at_start}")
+
                 dataset = self.training_loop.run_until_complete(
-                    self.fetch_training_data()
+                    self.fetch_training_data(block_at_start)
                 )
 
                 # Wait if training is paused
                 self.training_active.wait()
 
                 if self.master:
-                    self.model.config.block_list.append(self.current_block)
+                    self.model.config.block_list.append(block_at_start)
                     # Save config.json to disk to persist block_list updates
                     self.model.config.save_pretrained(self.output_dir)
 
